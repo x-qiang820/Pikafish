@@ -663,18 +663,12 @@ Value Search::Worker::search(
                 do_move(pos, ttData.move, st);
                 Key nextPosKey                             = pos.key();
                 auto [ttHitNext, ttDataNext, ttWriterNext] = tt.probe(nextPosKey);
-                ttDataNext.value =
-                  ttHitNext ? value_from_tt(ttDataNext.value, ss->ply + 1, pos.rule60_count())
-                            : VALUE_NONE;
                 undo_move(pos, ttData.move);
 
+                // Check that the ttValue after the tt move would also trigger a cutoff
                 if (!is_valid(ttDataNext.value))
                     return ttData.value;
-
-                if (ttData.value >= beta && -ttDataNext.value >= beta)
-                    return ttData.value;
-
-                if (ttData.value <= alpha && -ttDataNext.value <= alpha)
+                if ((ttData.value >= beta) == (-ttDataNext.value >= beta))
                     return ttData.value;
             }
             else
@@ -693,10 +687,7 @@ Value Search::Worker::search(
         goto moves_loop;
     }
     else if (excludedMove)
-    {
-        // Providing the hint that this node's accumulator will be used often
         unadjustedStaticEval = eval = ss->staticEval;
-    }
     else if (ss->ttHit)
     {
         // Never assume anything about values stored in TT
@@ -722,8 +713,7 @@ Value Search::Worker::search(
     }
 
     // Use static evaluation difference to improve quiet move ordering
-    if (((ss - 1)->currentMove).is_ok() && !(ss - 1)->inCheck && !priorCapture
-        && (ttData.depth - 2) <= depth)
+    if (((ss - 1)->currentMove).is_ok() && !(ss - 1)->inCheck && !priorCapture && !ttHit)
     {
         int bonus = std::clamp(-17 * int((ss - 1)->staticEval + ss->staticEval), -1052, 2031) + 333;
         thisThread->mainHistory[~us][((ss - 1)->currentMove).from_to()] << bonus * 1314 / 1024;
@@ -815,7 +805,7 @@ Value Search::Worker::search(
     // Step 9. Internal iterative reductions
     // For PV nodes without a ttMove as well as for deep enough cutNodes, we decrease depth.
     // (*Scaler) Especially if they make IIR less aggressive.
-    if (!allNode && depth >= (PvNode ? 5 : 7) && !ttData.move)
+    if (!allNode && depth >= 6 && !ttData.move)
         depth--;
 
     // Step 10. ProbCut
@@ -825,15 +815,13 @@ Value Search::Worker::search(
     if (depth >= 3
         && !is_decisive(beta)
         // If value from transposition table is lower than probCutBeta, don't attempt
-        // probCut there and in further interactions with transposition table cutoff
-        // depth is set to depth - 3 because probCut search has depth set to depth - 4
-        // but we also do a move before it. So effective depth is equal to depth - 3.
+        // probCut there
         && !(is_valid(ttData.value) && ttData.value < probCutBeta))
     {
         assert(probCutBeta < VALUE_INFINITE && probCutBeta > beta);
 
         MovePicker mp(pos, ttData.move, probCutBeta - ss->staticEval, &thisThread->captureHistory);
-        Depth      probCutDepth = std::max(depth - (4 + cutNode), 0);
+        Depth      probCutDepth = std::max(depth - 5, 0);
 
         while ((move = mp.next_move()) != Move::none())
         {
@@ -1040,13 +1028,12 @@ moves_loop:  // When in check, search starts here
 
             if (value < singularBeta)
             {
-                int corrValAdj1  = std::abs(correctionValue) / 265083;
-                int corrValAdj2  = std::abs(correctionValue) / 253680;
-                int doubleMargin = -4 + 254 * PvNode - 177 * !ttCapture - corrValAdj1
+                int corrValAdj   = std::abs(correctionValue) / 265083;
+                int doubleMargin = -4 + 254 * PvNode - 177 * !ttCapture - corrValAdj
                                  - 1045 * ttMoveHistory / 133568
                                  - (ss->ply > thisThread->rootDepth) * 43;
-                int tripleMargin = 96 + 282 * PvNode - 241 * !ttCapture + 96 * ss->ttPv
-                                 - corrValAdj2 - (ss->ply * 2 > thisThread->rootDepth * 3) * 54;
+                int tripleMargin = 96 + 282 * PvNode - 241 * !ttCapture + 96 * ss->ttPv - corrValAdj
+                                 - (ss->ply * 2 > thisThread->rootDepth * 3) * 54;
 
                 extension =
                   1 + (value < singularBeta - doubleMargin) + (value < singularBeta - tripleMargin);
@@ -1132,7 +1119,7 @@ moves_loop:  // When in check, search starts here
         else
             ss->statScore = 2 * thisThread->mainHistory[us][move.from_to()]
                           + (*contHist[0])[movedPiece][move.to_sq()]
-                          + (*contHist[1])[movedPiece][move.to_sq()] + 1000 * ss->inCheck - 4063;
+                          + (*contHist[1])[movedPiece][move.to_sq()] - 4063;
 
         // Decrease/increase reduction for moves with a good/bad history
         r -= ss->statScore * 1223 / 9641;
@@ -1290,15 +1277,13 @@ moves_loop:  // When in check, search starts here
                     assert(value >= beta);  // Fail high
                     break;
                 }
-                else
-                {
-                    // Reduce other moves if we have found at least one score improvement
-                    if (depth > 2 && depth < 11 && !is_decisive(value))
-                        depth -= 2;
 
-                    assert(depth > 0);
-                    alpha = value;  // Update alpha! Always alpha < beta
-                }
+                // Reduce other moves if we have found at least one score improvement
+                if (depth > 2 && depth < 11 && !is_decisive(value))
+                    depth -= 2;
+
+                assert(depth > 0);
+                alpha = value;  // Update alpha! Always alpha < beta
             }
         }
 
@@ -1321,7 +1306,7 @@ moves_loop:  // When in check, search starts here
     assert(moveCount || !ss->inCheck || excludedMove || !MoveList<LEGAL>(pos).size());
 
     // Adjust best value for fail high cases
-    if (bestValue >= beta && !is_decisive(bestValue) && !is_decisive(beta) && !is_decisive(alpha))
+    if (bestValue >= beta && !is_decisive(bestValue) && !is_decisive(alpha))
         bestValue = (bestValue * depth + beta) / (depth + 1);
 
     if (!moveCount)
@@ -1340,11 +1325,10 @@ moves_loop:  // When in check, search starts here
     // Bonus for prior quiet countermove that caused the fail low
     else if (!priorCapture && prevSq != SQ_NONE)
     {
-        int bonusScale = -332;
+        int bonusScale = -238;
         bonusScale += std::min(-(ss - 1)->statScore / 76, 237);
         bonusScale += std::min(63 * depth, 555);
         bonusScale += 151 * ((ss - 1)->moveCount > 11);
-        bonusScale += 94 * (ss->cutoffCnt <= 3);
         bonusScale += 74 * (!ss->inCheck && bestValue <= ss->staticEval - 162);
         bonusScale += 160 * (!(ss - 1)->inCheck && bestValue <= -(ss - 1)->staticEval - 103);
 
@@ -1510,9 +1494,8 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
         }
         else
         {
-            // In case of null move search, use previous static eval with opposite sign
-            unadjustedStaticEval =
-              (ss - 1)->currentMove != Move::null() ? evaluate(pos) : -(ss - 1)->staticEval;
+            unadjustedStaticEval = evaluate(pos);
+
             ss->staticEval = bestValue =
               to_corrected_static_eval(unadjustedStaticEval, correctionValue);
         }
